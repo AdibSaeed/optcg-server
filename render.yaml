@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: optcg-server
+    runtime: node
+    plan: starter
+    startCommand: node relay.js
+    envVars:
+      - key: USERS_FILE
+        value: /data/users.json
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
