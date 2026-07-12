@@ -20,6 +20,10 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
+let GAME = { meta: {}, starters: {} };
+try { GAME = JSON.parse(fs.readFileSync(path.join(__dirname, 'gamedata.json'), 'utf8')); } catch { console.error('gamedata.json missing — economy endpoints disabled'); }
+const finishedRooms = new Map(); // code -> {users:[names], t, claimed:{}}
+
 const PORT = process.env.PORT || 7460;
 const wss = new WebSocketServer({ port: PORT });
 const rooms = new Map(); // code -> { host, guest }
@@ -101,16 +105,137 @@ function handleAccountMsg(ws, msg) {
     saveUsers();
     return reply({ t: 'recover', ok: true, username: uname, token: u.token });
   }
-  // --------- server-synced collections (requires a valid login token)
-  if (msg.t === 'collGet' || msg.t === 'collSave') {
+  // --------- SERVER-AUTHORITATIVE collections & economy.
+  // Clients can only ask the server to perform actions; they can never write
+  // their collection directly, so editing the game files grants nothing.
+  if (msg.t && msg.t.startsWith('svr')) {
     const u = findUser(msg.username);
     if (!u || !msg.token || u.token !== msg.token) return reply({ t: 'coll', ok: false, why: 'Not logged in — log in again.' });
-    if (msg.t === 'collGet') return reply({ t: 'coll', ok: true, data: u.collection || null });
-    const raw = JSON.stringify(msg.data || {});
-    if (raw.length > 400000) return reply({ t: 'coll', ok: false, why: 'Collection too large.' });
-    u.collection = msg.data;
-    saveUsers();
-    return reply({ t: 'coll', ok: true });
+    const c = (u.collection = u.collection || { owned: {}, berries: 0 });
+    const ok = (extra = {}) => { saveUsers(); reply({ t: 'coll', ok: true, data: u.collection, ...extra }); };
+    const fail = (why) => reply({ t: 'coll', ok: false, why, data: u.collection });
+    const today = new Date().toISOString().slice(0, 10);
+
+    if (msg.t === 'svrColl') return ok();
+
+    if (msg.t === 'svrStarter') {
+      if (c.starter) return fail('Starter already chosen.');
+      const deck = GAME.starters[msg.leader];
+      if (!deck) return fail('Unknown starter leader.');
+      c.starter = msg.leader;
+      c.berries = (c.berries || 0) + 200;
+      for (const code of [msg.leader, ...deck]) c.owned[code] = (c.owned[code] || 0) + 1;
+      return ok();
+    }
+
+    if (msg.t === 'svrOpenPack') {
+      const setId = String(msg.setId || '');
+      const pool = Object.entries(GAME.meta).filter(([, m]) => m[0] === setId);
+      if (!pool.length) return fail('Unknown set.');
+      if (c.lastDaily !== today) { c.lastDaily = today; c.openedToday = 0; }
+      if (msg.paid) {
+        if ((c.berries || 0) < 100) return fail('Not enough Berries.');
+        c.berries -= 100;
+      } else {
+        if ((c.openedToday || 0) >= 3) return fail('No free packs left today.');
+        c.openedToday = (c.openedToday || 0) + 1;
+      }
+      const byR = {};
+      for (const [code, m] of pool) (byR[m[1]] = byR[m[1]] || []).push(code);
+      const pick = (rs) => { for (const r of rs) { const p = byR[r]; if (p && p.length) return p[Math.floor(Math.random() * p.length)]; } return pool[Math.floor(Math.random() * pool.length)][0]; };
+      const cards = [];
+      for (let i = 0; i < 7; i++) cards.push(pick(['C', 'UC']));
+      for (let i = 0; i < 3; i++) cards.push(pick(['UC', 'C']));
+      cards.push(pick(['R', 'UC']));
+      const roll = Math.random();
+      if ((c.pity || 0) >= 9) cards.push(pick(['SR', 'L', 'SEC', 'R']));
+      else if (roll < 0.08) cards.push(pick(['SEC', 'SR', 'L', 'R']));
+      else if (roll < 0.23) cards.push(pick(['L', 'SR', 'R']));
+      else if (roll < 0.55) cards.push(pick(['SR', 'R']));
+      else cards.push(pick(['R', 'UC']));
+      const HIT = new Set(['SR', 'L', 'SEC', 'TR']);
+      const hits = cards.filter((code) => HIT.has(GAME.meta[code][1]));
+      c.pity = hits.length ? 0 : (c.pity || 0) + 1;
+      const newOnes = [];
+      for (const code of cards) {
+        if (!c.owned[code]) newOnes.push(code);
+        c.owned[code] = (c.owned[code] || 0) + 1;
+      }
+      return ok({ cards, newOnes, hits });
+    }
+
+    const SELL = { C: 3, UC: 6, R: 15, SR: 40, L: 60, SEC: 100, TR: 40 };
+    const priceOf = (code) => SELL[(GAME.meta[code] || [])[1]] || 3;
+
+    if (msg.t === 'svrSell') {
+      const code = String(msg.code || '');
+      const own = c.owned[code] || 0;
+      const k = Math.min(Math.max(0, (msg.n | 0) || 1), Math.max(0, own - 1));
+      if (k <= 0) return fail('Nothing to sell (you always keep 1 copy).');
+      c.owned[code] = own - k;
+      const earned = k * priceOf(code);
+      c.berries = (c.berries || 0) + earned;
+      return ok({ earned });
+    }
+
+    if (msg.t === 'svrSellExtras') {
+      let earned = 0;
+      for (const [code, own] of Object.entries(c.owned)) {
+        if (own > 4) { earned += (own - 4) * priceOf(code); c.owned[code] = 4; }
+      }
+      c.berries = (c.berries || 0) + earned;
+      return ok({ earned });
+    }
+
+    if (msg.t === 'svrClaimBot') {
+      // small, capped practice reward — the server can't verify bot games
+      if (c.botDay !== today) { c.botDay = today; c.botClaims = 0; }
+      if ((c.botClaims || 0) >= 5) return fail('Daily practice rewards used up.');
+      c.botClaims = (c.botClaims || 0) + 1;
+      const amt = msg.won ? 50 : 25;
+      c.berries = (c.berries || 0) + amt;
+      return ok({ earned: amt });
+    }
+
+    if (msg.t === 'svrClaimMatch') {
+      const code = String(msg.room || '').toUpperCase();
+      let room = finishedRooms.get(code);
+      if (!room) {
+        const live = rooms.get(code);
+        if (live && live.users[0] && live.users[1] && Date.now() - live.created >= 180000) {
+          live.claimGuard = live.claimGuard || { users: live.users.filter(Boolean), claimed: {} };
+          room = live.claimGuard;
+        }
+      }
+      const uname = Object.keys(users).find((k) => users[k] === u);
+      if (!room || !room.users.includes(uname)) return fail('No completed match found for you in that room.');
+      if (room.claimed[uname]) return fail('Reward already claimed.');
+      room.claimed[uname] = true;
+      const amt = msg.won ? 100 : 50;
+      c.berries = (c.berries || 0) + amt;
+      return ok({ earned: amt });
+    }
+    return fail('Unknown request.');
+  }
+  // legacy client-pushed collections are no longer accepted
+  if (msg.t === 'collSave') return reply({ t: 'coll', ok: false, why: 'Collections are managed by the server now.' });
+  if (msg.t === 'collGet') {
+    const u = findUser(msg.username);
+    if (!u || !msg.token || u.token !== msg.token) return reply({ t: 'coll', ok: false, why: 'Not logged in.' });
+    return reply({ t: 'coll', ok: true, data: u.collection || null });
+  }
+  // deck-ownership check used by hosts before starting a match
+  if (msg.t === 'verifyDeck') {
+    const u = findUser(msg.username);
+    if (!u || !u.collection) return reply({ t: 'deckCheck', ok: false, why: 'Unknown player or no collection.' });
+    const owned = u.collection.owned || {};
+    const counts = {};
+    for (const code of msg.deck || []) counts[code] = (counts[code] || 0) + 1;
+    counts[msg.leader] = (counts[msg.leader] || 0) + 1;
+    for (const [code, n] of Object.entries(counts)) {
+      if ((owned[code] || 0) < n) return reply({ t: 'deckCheck', ok: false, why: `They don't own ${n}x ${code}.` });
+    }
+    return reply({ t: 'deckCheck', ok: true });
   }
 }
 
@@ -133,14 +258,14 @@ wss.on('connection', (ws) => {
     let msg = null;
     if (!isBinary) { try { msg = JSON.parse(data.toString()); } catch {} }
 
-    if (msg && ['register', 'login', 'recoverRequest', 'recoverConfirm', 'collGet', 'collSave'].includes(msg.t)) {
+    if (msg && (['register', 'login', 'recoverRequest', 'recoverConfirm', 'collGet', 'collSave', 'verifyDeck'].includes(msg.t) || String(msg.t).startsWith('svr'))) {
       handleAccountMsg(ws, msg);
       return;
     }
     if (msg && msg.t === 'create') {
       const code = newCode();
       ws.room = code; ws.isHost = true;
-      rooms.set(code, { host: ws, guest: null });
+      rooms.set(code, { host: ws, guest: null, created: Date.now(), users: [normName(msg.username) || null, null] });
       send(ws, { t: 'room', code });
       return;
     }
@@ -150,6 +275,7 @@ wss.on('connection', (ws) => {
       if (room.guest) { send(ws, { t: 'roomError', why: 'That room is already full.' }); return; }
       room.guest = ws;
       ws.room = room.host.room; ws.isHost = false;
+      room.users[1] = normName(msg.username) || null;
       send(room.host, { t: 'paired' });
       send(ws, { t: 'paired' });
       return;
@@ -167,8 +293,14 @@ wss.on('connection', (ws) => {
     if (!room) return;
     const partner = ws.isHost ? room.guest : room.host;
     if (partner && partner.readyState === 1) send(partner, { t: 'peerLeft' });
-    if (ws.isHost) rooms.delete(ws.room);
-    else room.guest = null;
+    if (ws.isHost) {
+      // record real matches (two named players, lasted ≥3 minutes) for rewards
+      if (room.users[0] && room.users[1] && Date.now() - room.created >= 180000) {
+        finishedRooms.set(ws.room, { users: room.users.filter(Boolean), t: Date.now(), claimed: {} });
+        if (finishedRooms.size > 300) finishedRooms.delete(finishedRooms.keys().next().value);
+      }
+      rooms.delete(ws.room);
+    } else room.guest = null;
   });
   ws.on('error', () => {});
 });
