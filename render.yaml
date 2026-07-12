@@ -3,6 +3,7 @@ services:
     name: optcg-server
     runtime: node
     plan: starter
+    buildCommand: npm install
     startCommand: node relay.js
     envVars:
       - key: USERS_FILE
