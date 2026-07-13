@@ -24,6 +24,11 @@ let GAME = { meta: {}, starters: {} };
 try { GAME = JSON.parse(fs.readFileSync(path.join(__dirname, 'gamedata.json'), 'utf8')); } catch { console.error('gamedata.json missing — economy endpoints disabled'); }
 const finishedRooms = new Map(); // code -> {users:[names], t, claimed:{}}
 
+// must match DAILY_PACKS / PACK_COST in src/collection.js — the server is the
+// authority on the economy for logged-in players, the client only mirrors it
+const DAILY_PACKS = 2;
+const PACK_COST = 100;
+
 const PORT = process.env.PORT || 7460;
 const wss = new WebSocketServer({ port: PORT });
 const rooms = new Map(); // code -> { host, guest }
@@ -134,10 +139,10 @@ function handleAccountMsg(ws, msg) {
       if (!pool.length) return fail('Unknown set.');
       if (c.lastDaily !== today) { c.lastDaily = today; c.openedToday = 0; }
       if (msg.paid) {
-        if ((c.berries || 0) < 100) return fail('Not enough Berries.');
-        c.berries -= 100;
+        if ((c.berries || 0) < PACK_COST) return fail('Not enough Berries.');
+        c.berries -= PACK_COST;
       } else {
-        if ((c.openedToday || 0) >= 3) return fail('No free packs left today.');
+        if ((c.openedToday || 0) >= DAILY_PACKS) return fail('No free packs left today.');
         c.openedToday = (c.openedToday || 0) + 1;
       }
       const byR = {};
